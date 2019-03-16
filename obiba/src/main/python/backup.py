@@ -37,6 +37,7 @@ class ObibaBackup:
             self.__setup()
             self.__backupRemoteProjects()
             self.__backupProjects()
+            self.__rsyncCleanup()
         except Exception, e:
             print '*' * 80
             print "* ERROR"
@@ -60,7 +61,7 @@ class ObibaBackup:
         """
         Setup basically creates the daily backup folder for each project
         """
-
+        #Local backup folder
         backupFolder = self.config['destination']
         self.__createBackupFolder(backupFolder)
 
@@ -70,9 +71,21 @@ class ObibaBackup:
         if 'projects' in self.config:
             for project in self.config['projects'].iterkeys():
                 timestamp = datetime.now().strftime('%d-%H-%M-%S')
-                backupDestination = os.path.join(backupFolder, project, str(today.year), today.strftime('%m'), timestamp)
+                backupDestination = os.path.join(backupFolder, project, str(today.year)+'-'+today.strftime('%m'), timestamp)
                 self.__createBackupFolder(backupDestination)
-                self.config['projects'][project]['destination'] = backupDestination            
+                self.config['projects'][project]['destination'] = backupDestination
+                
+        #Remote backup folder
+        if 'rsync' in self.config:
+            backupFolder = self.config['rsync']['destination']
+            self.__createBackupFolder(backupFolder)
+    
+            # create the date based backup folder
+            today = date.today()
+            timestamp = datetime.now().strftime('%d-%H-%M-%S')
+            backupDestination = os.path.join(backupFolder, str(today.year)+'-'+today.strftime('%m'), timestamp)
+            self.__createBackupFolder(backupDestination)
+            self.config['rsync']['destination'] = backupDestination                
 
     ####################################################################################################################
     def __backupRemoteProjects(self):
@@ -116,9 +129,12 @@ class ObibaBackup:
                         excludes.append('%s' % exclude)
                         
                 publicKey = ''
+                remove_source_files = ''
+
                 #Encrypt before copying remotely if required
                 if 'encrypt_files' in self.config['rsync']:
-                    encryptionPassword = self.config['rsync']['encrypt_files']
+                    if 'encryptionPassword' in self.config['rsync']['encrypt_files']:
+                        encryptionPassword = self.config['rsync']['encrypt_files']['encryptionPassword']
                     
                     if encryptionPassword:
                         encryptedFile=self.__encryptFiles(source, encryptionPassword, remote)
@@ -129,6 +145,10 @@ class ObibaBackup:
                     else:
                         print "If encrypt_file flag included in rsync, a password must be provided. Aborting rsync." 
                         return
+                    
+                    if 'remove_source_files' in self.config['rsync']['encrypt_files']:
+                        if self.config['rsync']['encrypt_files']['remove_source_files']: remove_source_files = "--remove-source-files"
+
                 else:
                     folder = remote if remote else os.path.basename(source['path'])
                     source = os.path.join(source['path'], '')
@@ -136,12 +156,14 @@ class ObibaBackup:
         
                 if 'pem' in self.config['rsync']:
                     publicKey = "ssh -i %s" % self.config['rsync']['pem']
-        
+
                 print "Backing up %s to remote server %s..." % (source, self.config['rsync']['destination'])
-                print "rsync -Atrave '%s' %s %s %s" % (publicKey, ' '.join(str(x) for x in excludes), source, destination)
+                print "rsync %s -Atrave '%s' %s %s %s" % (remove_source_files,publicKey, ' '.join(str(x) for x in excludes), source, destination)
+                print str(excludes)
                 result = subprocess.check_output(
                   [
                       'rsync',
+                      remove_source_files,
                       '-Atrave',
                       publicKey,
                       source,
@@ -154,21 +176,63 @@ class ObibaBackup:
                 print "No destination specified in rysnc. Aborting rsync."
 
     ####################################################################################################################
-    def __cleanup(self, destination, project):
-        month = self.config['keep']['month']
-        days = self.config['keep']['days']
-        if 'keep' in self.config['projects'][project]:
-            if 'month' in self.config['projects'][project]['keep']:
-                month = self.config['projects'][project]['keep']['month']
-            if 'days' in self.config['projects'][project]['keep']:
-                days = self.config['projects'][project]['keep']['days']
-        self.__cleanupFolders(os.path.dirname(destination), month)
-        self.__cleanupFolders(destination, days)
+    def __rsyncCleanup(self):
+        if 'rsync' in self.config:
+            destination = self.config['rsync']['destination']
+            self.__cleanup(destination, 'rsync')
 
     ####################################################################################################################
-    def __cleanupFolders(self, destination, keep):
-        sortedFolders = self.__getSortedFolderList(destination)
-        self.__deleteFolders(len(sortedFolders) - keep, destination, sortedFolders)
+    def __cleanup(self, destination, cleanType):
+        # This is a significant rework of the Maelstrom code, the enhancements include: 
+        # Enable clean up on the rsync remote folder
+        # Enable clean up to roll round the year end and month end
+        # Enable specific dates to be retained in the rolling month.
+        month = self.config['keep']['month']
+        days = self.config['keep']['days']
+        dates_to_keep = []
+        if 'dates' in self.config['keep']:
+            dates_to_keep =  self.config['keep']['dates']
+            
+        if cleanType == 'rsync':
+            if 'keep' in self.config['rsync']:
+                if 'month' in self.config['rsync']['keep']: month = self.config['rsync']['keep']['month']
+                if 'days' in self.config['rsync']['keep']: days = self.config['rsync']['keep']['days']
+                if 'dates' in self.config['rsync']['keep']: dates = self.config['rsync']['keep']['dates'] 
+
+        elif cleanType in self.config['projects']:
+            project = cleanType
+            if 'keep' in self.config['projects'][project]:
+                if 'month' in self.config['projects'][project]['keep']:
+                    month = self.config['projects'][project]['keep']['month']
+                if 'days' in self.config['projects'][project]['keep']:
+                    days = self.config['projects'][project]['keep']['days']
+                if 'dates' in self.config['projects'][project]['keep']:
+                    dates = self.config['projects'][project]['keep']['dates'] 
+
+        #Clean up year-month folders
+        folders = []
+        folders.append(os.path.dirname(destination))
+        self.__cleanupFolders(folders, month, dates_to_keep)
+        
+        #Get name of previous months folder. Assume the folder format is yyyy-mm
+        year_month = os.path.basename(os.path.normpath(destination))
+        if year_month[:-2] == "12":
+            year_month = str(year_month[:4]+1)+'-01' #Subtract one from the year and set month to Jan
+        else:
+            year_month = year_month[:-2]+str(int(year_month[-2:])-1).zfill(2) #Add one to the month
+
+        #Clean-up days in current and previous month folder. 
+        folders = []
+        folders.append(destination)
+        if os.path.exists(os.path.dirname(destination)+os.sep+year_month):
+            folders.append(os.path.dirname(destination)+os.sep+year_month)
+        self.__cleanupFolders(folders, days, dates_to_keep)
+
+
+    ####################################################################################################################
+    def __cleanupFolders(self, destination, keep, exclude_folders_begining_with):
+        sortedFolders = self.__getSortedFolderList(destination, exclude_folders_begining_with)
+        self.__deleteFolders(len(sortedFolders) - keep, sortedFolders)
 
     ####################################################################################################################
     def __backupFiles(self, files, destination):
@@ -176,10 +240,10 @@ class ObibaBackup:
             print "\tBacking up file %s to %s" % (file, destination)
             for fileItem in glob.glob(file):
                 if os.path.isfile(fileItem):
-                  destinationPath = os.path.join(destination, os.path.dirname(fileItem)[1:])
-                  if not os.path.exists(destinationPath):
-                    os.makedirs(destinationPath)
-                  shutil.copy(fileItem, destinationPath)
+                    destinationPath = os.path.join(destination, os.path.dirname(fileItem)[1:])
+                    if not os.path.exists(destinationPath):
+                        os.makedirs(destinationPath)
+                    shutil.copy(fileItem, destinationPath)
 
     #################################################################################################################### 
     def __backupFolders(self, folders, destination):
@@ -205,7 +269,7 @@ class ObibaBackup:
     
             destinationPath = os.path.join(destination, folder_path[1:])
             if not os.path.exists(destinationPath):
-              os.makedirs(destinationPath)
+                os.makedirs(destinationPath)
             backupFile = os.path.join(destinationPath, filename)
             #print ' '.join(str(x) for x in ["tar", "czfP", backupFile, folder_path] + excludes)
             result = call(["tar", "czfP", backupFile, folder_path] + excludes) 
@@ -323,24 +387,32 @@ class ObibaBackup:
         return encryptedFile
     
     ####################################################################################################################
-    def __deleteFolders(self, deleteCount, destination, sortedFolders):
+    def __deleteFolders(self, deleteCount, sortedFolders):
         if deleteCount > 0:
             foldersToDelete = sortedFolders[:deleteCount]
             for folder in foldersToDelete:
-                print "\tDeleting %s" % os.path.join(destination, folder[0])
-                shutil.rmtree(os.path.join(destination, folder[0]))
+                print "\tDeleting %s" % folder[0]
+                shutil.rmtree(folder[0])
 
     ####################################################################################################################
-    def __getSortedFolderList(self, destination):
-        files = os.listdir(destination)
-        file_date_tuple_list = [(x, os.path.getmtime(os.path.join(destination, x))) for x in files]
-        file_date_tuple_list.sort(key=lambda x: x[1])
-        return file_date_tuple_list
+    def __getSortedFolderList(self, destinations, dates_to_exclude):
+        #Assumes dates_to_exclude is a list of 2 digit dates, add hyphen to each item in dates_to_exclude
+        dates_to_exclude = [str(date).zfill(2)+"-" for date in dates_to_exclude] 
+        dir_file_date_list = []
+        for destination in destinations:
+            for item in os.listdir(destination):
+                if item[:3] not in dates_to_exclude:
+                    file_attributes = [os.path.join(destination, item),item, os.path.getmtime(os.path.join(destination, item))]
+                    dir_file_date_list.append(file_attributes)
+        
+        dir_file_date_list.sort(key=lambda x: x[2]) #Sort by third item (date)
+        return dir_file_date_list
 
     ####################################################################################################################
     def __createBackupFolder(self, path):
         if not os.path.exists(path):
             os.makedirs(path)
+
 
 ####################################################################################################################
 # S C R I P T    M A I N    E N T R Y
