@@ -82,7 +82,7 @@ class ObibaBackup:
     
             # create the date based backup folder
             today = date.today()
-            timestamp = datetime.now().strftime('%d-%H-%M-%S')
+            timestamp = datetime.now().strftime('%d-%H%M%S')
             backupDestination = os.path.join(backupFolder, str(today.year)+'-'+today.strftime('%m'), timestamp)
             self.__createBackupFolder(backupDestination)
             self.config['rsync']['destination'] = backupDestination                
@@ -179,7 +179,7 @@ class ObibaBackup:
     def __rsyncCleanup(self):
         if 'rsync' in self.config:
             destination = self.config['rsync']['destination']
-            self.__cleanup(destination, 'rsync')
+            self.__cleanup(os.path.dirname(destination), 'rsync')
 
     ####################################################################################################################
     def __cleanup(self, destination, cleanType):
@@ -197,7 +197,7 @@ class ObibaBackup:
             if 'keep' in self.config['rsync']:
                 if 'month' in self.config['rsync']['keep']: month = self.config['rsync']['keep']['month']
                 if 'days' in self.config['rsync']['keep']: days = self.config['rsync']['keep']['days']
-                if 'dates' in self.config['rsync']['keep']: dates = self.config['rsync']['keep']['dates'] 
+                if 'dates' in self.config['rsync']['keep']: dates_to_keep = self.config['rsync']['keep']['dates'] 
 
         elif cleanType in self.config['projects']:
             project = cleanType
@@ -207,25 +207,28 @@ class ObibaBackup:
                 if 'days' in self.config['projects'][project]['keep']:
                     days = self.config['projects'][project]['keep']['days']
                 if 'dates' in self.config['projects'][project]['keep']:
-                    dates = self.config['projects'][project]['keep']['dates'] 
-
+                    dates_to_keep = self.config['projects'][project]['keep']['dates'] 
+        
         #Clean up year-month folders
         folders = []
         folders.append(os.path.dirname(destination))
-        self.__cleanupFolders(folders, month, dates_to_keep)
+        self.__cleanupFolders(folders, month, [])
         
         #Get name of previous months folder. Assume the folder format is yyyy-mm
-        year_month = os.path.basename(os.path.normpath(destination))
-        if year_month[:-2] == "12":
-            year_month = str(year_month[:4]+1)+'-01' #Subtract one from the year and set month to Jan
+        year_previous_month = os.path.basename(os.path.normpath(destination))
+        if year_previous_month[:-2] == "12":
+            year_previous_month = str(year_previous_month[:4]+1)+'-01' #Subtract one from the year and set month to Jan
         else:
-            year_month = year_month[:-2]+str(int(year_month[-2:])-1).zfill(2) #Add one to the month
+            year_previous_month = year_previous_month[:-2]+str(int(year_previous_month[-2:])-1).zfill(2) #Add one to the month
 
+        #Format dates_to_keep as a list of 2 digit dates, add trailing hyphen to each item in dates_to_keep
+        dates_to_keep = [str(date).zfill(2)+"-" for date in dates_to_keep] 
+        
         #Clean-up days in current and previous month folder. 
         folders = []
         folders.append(destination)
-        if os.path.exists(os.path.dirname(destination)+os.sep+year_month):
-            folders.append(os.path.dirname(destination)+os.sep+year_month)
+        if os.path.exists(os.path.dirname(destination)+os.sep+year_previous_month):
+            folders.append(os.path.dirname(destination)+os.sep+year_previous_month)
         self.__cleanupFolders(folders, days, dates_to_keep)
 
 
@@ -395,14 +398,22 @@ class ObibaBackup:
                 shutil.rmtree(folder[0])
 
     ####################################################################################################################
-    def __getSortedFolderList(self, destinations, dates_to_exclude):
-        #Assumes dates_to_exclude is a list of 2 digit dates, add hyphen to each item in dates_to_exclude
-        dates_to_exclude = [str(date).zfill(2)+"-" for date in dates_to_exclude] 
+    def __getSortedFolderList(self, destinations, ignore_folders_begining_with):
+        #Build a folder list and sort by last modified date. 
+        #Excluded any folder from the list if they begin with any of the values in ignore_folders_begining_with
         dir_file_date_list = []
         for destination in destinations:
-            for item in os.listdir(destination):
-                if item[:3] not in dates_to_exclude:
-                    file_attributes = [os.path.join(destination, item),item, os.path.getmtime(os.path.join(destination, item))]
+            for folder in os.listdir(destination):
+                #Check if folder begins with a value that we want to ignore
+                bln_ignore = False
+                for ignore in ignore_folders_begining_with:
+                    if folder[:len(ignore)] == ignore:
+                        bln_ignore = True
+                        break
+                
+                #Add the folder to the list
+                if not bln_ignore:
+                    file_attributes = [os.path.join(destination, folder),folder, os.path.getmtime(os.path.join(destination, folder))]
                     dir_file_date_list.append(file_attributes)
         
         dir_file_date_list.sort(key=lambda x: x[2]) #Sort by third item (date)
